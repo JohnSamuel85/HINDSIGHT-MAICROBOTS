@@ -1,0 +1,168 @@
+[
+  {
+    "case_id": "PAY-1021",
+    "scenario": "API Timeout",
+    "entity": "Payment Gateway Service",
+    "problem": "Payment Gateway API returning 504 Gateway Timeout during flash sale peak traffic.",
+    "context": "Annual Black Friday flash sale event with 8x standard transaction volume spike.",
+    "symptoms": [
+      "504 Gateway Timeout on /v1/charges",
+      "p99 latency surged from 210ms to >15000ms",
+      "Upstream NGINX reverse proxy terminating idle client connections"
+    ],
+    "root_cause": "Database connection pool starvation on the primary PostgreSQL cluster causing thread contention in checkout workers.",
+    "action_attempted": "Increased the NGINX proxy_read_timeout and backend application timeout from 15s to 60s.",
+    "worked_or_failed": "Failed",
+    "outcome": "FAILED",
+    "final_resolution": "Incident exacerbated. Increasing timeouts retained hung database sockets longer, cascading connection exhaustion to other critical services and leading to a complete API gateway lockup.",
+    "lesson_learned": "Never increase request timeouts during database contention. Increasing timeouts simply holds hung sockets open longer, compounding thread pool saturation and degrading the entire gateway.",
+    "timestamp": "2025-11-28T14:22:00Z"
+  },
+  {
+    "case_id": "PAY-1142",
+    "scenario": "API Timeout",
+    "entity": "Payment Gateway Service",
+    "problem": "Payment Gateway API returning 504 Gateway Timeout under sustained high throughput.",
+    "context": "Post-incident investigation following the PAY-1021 outage during subsequent holiday weekend surge.",
+    "symptoms": [
+      "Worker process pool saturation",
+      "HikariCP connection pool reporting 0 idle connections and high wait time (>5000ms)",
+      "Read queries locking row tables during credit verification"
+    ],
+    "root_cause": "HikariCP database connection pool max connections set to 20 per pod with missing indices on charge idempotency checks.",
+    "action_attempted": "Added covering index on charge_idempotency_keys, doubled HikariCP pool size with PgBouncer transaction pooling, and routed non-critical merchant verification reads to read-replicas.",
+    "worked_or_failed": "Worked",
+    "outcome": "RESOLVED",
+    "final_resolution": "DB connection wait dropped from 5400ms to 4ms. p99 latency stabilized at 180ms under 12,000 req/sec peak load with zero 504 timeouts.",
+    "lesson_learned": "Address database connection pool exhaustion directly with PgBouncer connection pooling and read-replica offloading rather than masking symptoms with timeout adjustments.",
+    "timestamp": "2025-12-05T09:15:00Z"
+  },
+  {
+    "case_id": "PAY-1198",
+    "scenario": "API Timeout",
+    "entity": "Payment Gateway Service",
+    "problem": "Periodic 504 Gateway Timeouts during merchant batch payout synchronization.",
+    "context": "Midnight batch settlement processing triggered concurrently with European market opening.",
+    "symptoms": [
+      "Settlement batch workers blocking HTTP transaction threads",
+      "504 Gateway Timeout errors on synchronous authorization endpoint"
+    ],
+    "root_cause": "Batch payout process was executing long-running transactional locks on the ledger table shared by synchronous checkout endpoints.",
+    "action_attempted": "Decoupled batch settlement execution to asynchronous background Celery workers with strict chunked batching of 500 records and read-committed isolation.",
+    "worked_or_failed": "Worked",
+    "outcome": "RESOLVED",
+    "final_resolution": "Synchronous checkout API completely isolated from background ledger updates. Zero 504 timeouts during subsequent midnight settlement runs.",
+    "lesson_learned": "Synchronous checkout paths must never compete for row-level table locks with background settlement pipelines.",
+    "timestamp": "2026-01-14T02:40:00Z"
+  },
+  {
+    "case_id": "ESC-2041",
+    "scenario": "Customer Escalation",
+    "entity": "Acme Global Enterprise",
+    "problem": "Tier-1 Enterprise customer experiencing unexpected 429 Too Many Requests spikes on API v2.",
+    "context": "Customer deployed new multi-region ERP sync pipeline generating sudden bursty traffic batches.",
+    "symptoms": [
+      "Customer receiving 429 Too Many Requests on /api/v2/orders",
+      "Enterprise SLA breach alerts triggered",
+      "Customer CTO opened executive escalation ticket"
+    ],
+    "root_cause": "Token-bucket rate limiter was configured with a strict per-second window (50 req/sec) without burst capacity, penalizing microbursts from distributed workers.",
+    "action_attempted": "Globally doubled the standard rate limit across all customer tiers in Redis from 50 to 100 req/sec.",
+    "worked_or_failed": "Failed",
+    "outcome": "FAILED",
+    "final_resolution": "Global rate increase overwhelmed downstream inventory microservices, triggering unthrottled noisy-neighbor degradation across multiple tenants.",
+    "lesson_learned": "Do not relax global tenant rate limits to satisfy one bursty enterprise customer. It introduces cross-tenant instability and risks downstream cluster failure.",
+    "timestamp": "2025-10-18T11:05:00Z"
+  },
+  {
+    "case_id": "ESC-2088",
+    "scenario": "Customer Escalation",
+    "entity": "Acme Global Enterprise",
+    "problem": "Enterprise customer experiencing unexpected 429 rate-limit spikes on API v2 during scheduled syncing.",
+    "context": "Follow-up remediation from ESC-2041 to establish sustainable enterprise tiering.",
+    "symptoms": [
+      "Microburst spikes from 8 distributed client nodes executing simultaneous cron syncs",
+      "Periodic 429 responses despite average usage staying well below daily quota"
+    ],
+    "root_cause": "Client was submitting synchronized concurrent batches every minute at :00 second without exponential jitter or client-side token pooling.",
+    "action_attempted": "Implemented Leaky Bucket with Burst allowance (allow burst up to 250 requests with 50/sec sustained refill) for Enterprise SLA tier, provided customer with jittered batching SDK, and added Retry-After header with exact millisecond resolution.",
+    "worked_or_failed": "Worked",
+    "outcome": "RESOLVED",
+    "final_resolution": "Burst capacity absorbed multi-threaded client batches seamlessly. Customer successfully processed 1.2M sync calls without a single 429 error, protecting downstream services.",
+    "lesson_learned": "Enterprise rate limiting requires burst headroom and dynamic Retry-After response headers, coupled with client-side request jitter.",
+    "timestamp": "2025-10-22T16:30:00Z"
+  },
+  {
+    "case_id": "ESC-2105",
+    "scenario": "Customer Escalation",
+    "entity": "NovaFin Technologies",
+    "problem": "Fintech partner encountering false-positive 429 rate-limit errors after IP migration.",
+    "context": "Partner migrated their microservices to Cloudflare egress IPs shared by other services.",
+    "symptoms": [
+      "429 responses triggered immediately upon first request of the day",
+      "Customer API keys were under quota"
+    ],
+    "root_cause": "Rate limiting middleware was keying on X-Forwarded-For IP address instead of the verified Organization API Key hash.",
+    "action_attempted": "Refactored rate limiting key generator to prioritize HMAC of Bearer API Key over client IP address, adding client IP only as fallback for unauthenticated routes.",
+    "worked_or_failed": "Worked",
+    "outcome": "RESOLVED",
+    "final_resolution": "False positive throttles eliminated. Authenticated enterprise clients are now strictly evaluated on their contract-backed API key identity.",
+    "lesson_learned": "Authenticated API rate limits must always key on verified API token identity, never client-reported network IP addresses.",
+    "timestamp": "2026-02-03T18:10:00Z"
+  },
+  {
+    "case_id": "SUB-3012",
+    "scenario": "Repeated Payment Failure",
+    "entity": "Stripe Webhook Pipeline",
+    "problem": "Stripe webhook failures causing recurring subscription renewal drops and false customer churn.",
+    "context": "Monthly renewal cycle for 45,000 SaaS subscriptions encountering payment webhook dropped events.",
+    "symptoms": [
+      "Stripe dashboard displaying 500 error responses on invoice.payment_succeeded events",
+      "User accounts mistakenly marked past_due or suspended",
+      "High volume of urgent support tickets from paying customers"
+    ],
+    "root_cause": "Webhook handler was executing synchronous invoice PDF generation and external CRM sync inside the incoming HTTP request thread, timing out after 10 seconds.",
+    "action_attempted": "Configured Stripe dashboard to immediately retry failed webhook deliveries with automated 3x retry schedule.",
+    "worked_or_failed": "Failed",
+    "outcome": "FAILED",
+    "final_resolution": "Immediate retries worsened the queue backlog. Hundreds of duplicate retries hit the un-optimized endpoint, amplifying server load and creating duplicate billing receipts in customer accounts.",
+    "lesson_learned": "Do not rely on upstream webhook retries to resolve synchronous processing bottlenecks. Retrying slow webhooks creates cascading retry storms and dangerous duplicate processing.",
+    "timestamp": "2025-08-12T08:45:00Z"
+  },
+  {
+    "case_id": "SUB-3055",
+    "scenario": "Repeated Payment Failure",
+    "entity": "Stripe Webhook Pipeline",
+    "problem": "Stripe webhook processing drops causing subscription renewal failures.",
+    "context": "Architecture overhaul following SUB-3012 incident.",
+    "symptoms": [
+      "Webhook processing taking up to 12s per event",
+      "Stripe terminating connection due to 10s webhook timeout"
+    ],
+    "root_cause": "Lack of asynchronous event buffering and missing idempotency enforcement in the webhook intake controller.",
+    "action_attempted": "Restructured webhook intake to immediately verify signature, insert event ID into Redis idempotency store, enqueue payload to RabbitMQ/Redis queue, and return HTTP 200 within 45ms. Asynchronous workers then process billing state and CRM sync.",
+    "worked_or_failed": "Worked",
+    "outcome": "RESOLVED",
+    "final_resolution": "Webhook acknowledgement latency dropped from 12,000ms to 38ms. 100% of renewal events successfully processed with zero duplicate invoices and zero customer churn errors.",
+    "lesson_learned": "Webhook endpoints must only acknowledge receipt and queue work asynchronously. Never execute synchronous business logic inside a webhook receiver.",
+    "timestamp": "2025-08-20T14:15:00Z"
+  },
+  {
+    "case_id": "SUB-3091",
+    "scenario": "Repeated Payment Failure",
+    "entity": "Stripe Webhook Pipeline",
+    "problem": "Out-of-order webhook delivery causing customer subscriptions to stay in 'inactive' status after successful payment.",
+    "context": "Customer updated credit card and triggered invoice.payment_failed followed immediately by invoice.payment_succeeded.",
+    "symptoms": [
+      "Customer charged successfully on Stripe, but portal shows account suspended",
+      "invoice.payment_succeeded arrived before invoice.payment_failed due to network race condition"
+    ],
+    "root_cause": "Webhook consumer was updating user status blindly without checking the event object's creation timestamp against current database state.",
+    "action_attempted": "Implemented optimistic state locking using Stripe event.created timestamp. Older events are discarded if a newer event for the same subscription has already been recorded.",
+    "worked_or_failed": "Worked",
+    "outcome": "RESOLVED",
+    "final_resolution": "Out-of-order webhook events safely ignored. Subscription state perfectly synchronized with Stripe source of truth.",
+    "lesson_learned": "Always enforce event timestamp sequencing on webhook handlers to prevent stale failure events from overwriting successful transactions.",
+    "timestamp": "2026-03-01T10:00:00Z"
+  }
+]
